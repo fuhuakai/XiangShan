@@ -950,14 +950,20 @@ class BlockHelper(latency: Int)(implicit p: Parameters) extends XSModule {
   }
 }
 
+// PTEHelper: DPI-C ExtModule for software page table walk
+// Used in softPTW/softTLB debug mode to bypass hardware PTW
+// Supports H-extension two-stage address translation
 class PTEHelper() extends ExtModule {
-  val clock  = IO(Input(Clock()))
-  val enable = IO(Input(Bool()))
-  val satp   = IO(Input(UInt(64.W)))
-  val vpn    = IO(Input(UInt(64.W)))
-  val pte    = IO(Output(UInt(64.W)))
-  val level  = IO(Output(UInt(8.W)))
-  val pf     = IO(Output(UInt(8.W)))
+  val clock   = IO(Input(Clock()))
+  val enable  = IO(Input(Bool()))
+  val satp    = IO(Input(UInt(64.W)))  // Host satp for noS2xlate mode
+  val vsatp   = IO(Input(UInt(64.W)))  // Guest vsatp for VS-stage
+  val hgatp   = IO(Input(UInt(64.W)))  // Hypervisor hgatp for G-stage
+  val vpn     = IO(Input(UInt(64.W)))  // Virtual page number to translate
+  val s2xlate = IO(Input(UInt(8.W)))   // Translation mode
+  val pte     = IO(Output(UInt(64.W))) // Output: final PTE
+  val level   = IO(Output(UInt(8.W)))  // Output: page level
+  val pf      = IO(Output(UInt(8.W)))  // Output: page fault type (0=none, 1=VS, 2=G)
 }
 
 class PTWDelayN[T <: Data](gen: T, n: Int, flush: Bool) extends Module {
@@ -997,48 +1003,131 @@ object PTWDelayN {
   }
 }
 
+// FakePTW: Software PTW implementation using DPI-C PTEHelper
+// Used when coreParams.softPTW is enabled for debug/simulation
+// Supports H-extension two-stage address translation
 class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
   val io = IO(new L2TLBIO)
+
+  // Flush signals for each TLB port
   val flush = VecInit(Seq.fill(PtwWidth)(false.B))
-  flush(0) := DelayN(io.sfence.valid || io.csr.tlb.satp.changed || io.csr.tlb.vsatp.changed || io.csr.tlb.hgatp.changed || io.csr.tlb.priv.virt_changed, itlbParams.fenceDelay)
-  flush(1) := DelayN(io.sfence.valid || io.csr.tlb.satp.changed || io.csr.tlb.vsatp.changed || io.csr.tlb.hgatp.changed || io.csr.tlb.priv.virt_changed, ldtlbParams.fenceDelay)
+  val flushCond = io.sfence.valid ||
+    io.csr.tlb.satp.changed ||
+    io.csr.tlb.vsatp.changed ||
+    io.csr.tlb.hgatp.changed ||
+    io.csr.tlb.priv.virt_changed
+  // flush(0) := DelayN(flushCond, itlbParams.fenceDelay)
+  // flush(1) := DelayN(flushCond, ldtlbParams.fenceDelay)
+    flush(0) := flushCond
+    flush(1) := flushCond
+
   for (i <- 0 until PtwWidth) {
+    // PTEHelper: DPI-C module for software page table walk
     val helper = Module(new PTEHelper())
     helper.clock := clock
-    helper.satp := io.csr.tlb.satp.ppn
 
+    // Host satp for single-stage translation (noS2xlate mode)
+    helper.satp := Cat(io.csr.tlb.satp.mode, io.csr.tlb.satp.asid, io.csr.tlb.satp.ppn)
+
+    // Guest vsatp for VS-stage translation (H-extension)
+    helper.vsatp := Cat(io.csr.tlb.vsatp.mode, io.csr.tlb.vsatp.asid, io.csr.tlb.vsatp.ppn)
+
+    // Hypervisor hgatp for G-stage translation (H-extension)
+    helper.hgatp := Cat(io.csr.tlb.hgatp.mode, io.csr.tlb.hgatp.vmid, io.csr.tlb.hgatp.ppn)
+
+    // Connect helper inputs with optional delay for timing simulation
     if (coreParams.softPTWDelay == 1) {
       helper.enable := io.tlb(i).req(0).fire
       helper.vpn := io.tlb(i).req(0).bits.vpn
+      helper.s2xlate := io.tlb(i).req(0).bits.s2xlate
     } else {
       helper.enable := PTWDelayN(io.tlb(i).req(0).fire, coreParams.softPTWDelay - 1, flush(i))
       helper.vpn := PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay - 1, flush(i))
+      helper.s2xlate := PTWDelayN(io.tlb(i).req(0).bits.s2xlate, coreParams.softPTWDelay - 1, flush(i))
     }
 
+    // Parse helper outputs
     val pte = helper.pte.asTypeOf(new PteBundle)
     val level = helper.level
     val pf = helper.pf
+    val vpnDelayed = PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay, flush(i))
+    val s2xlateReg = if (coreParams.softPTWDelay == 1) {
+      RegEnable(io.tlb(i).req(0).bits.s2xlate, io.tlb(i).req(0).fire)
+    } else {
+      PTWDelayN(io.tlb(i).req(0).bits.s2xlate, coreParams.softPTWDelay, flush(i))
+    }
+
+    // Request/response handshake logic
     val empty = RegInit(true.B)
-    when (io.tlb(i).req(0).fire) {
+    when(io.tlb(i).req(0).fire) {
       empty := false.B
-    } .elsewhen (io.tlb(i).resp.fire || flush(i)) {
+    }.elsewhen(io.tlb(i).resp.fire || flush(i)) {
       empty := true.B
     }
 
     io.tlb(i).req(0).ready := empty || io.tlb(i).resp.fire
     io.tlb(i).resp.valid := PTWDelayN(io.tlb(i).req(0).fire, coreParams.softPTWDelay, flush(i))
     assert(!io.tlb(i).resp.valid || io.tlb(i).resp.ready)
-    io.tlb(i).resp.bits.s1.entry.tag := PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay, flush(i))
+
+    // S1 (VS-Stage) response - PtwSectorResp fields
+    io.tlb(i).resp.bits.s1.entry.tag := vpnDelayed
     io.tlb(i).resp.bits.s1.entry.pbmt := pte.pbmt
     io.tlb(i).resp.bits.s1.entry.ppn := pte.ppn
     io.tlb(i).resp.bits.s1.entry.perm.map(_ := pte.getPerm())
     io.tlb(i).resp.bits.s1.entry.level.map(_ := level)
-    io.tlb(i).resp.bits.s1.pf := pf
-    io.tlb(i).resp.bits.s1.af := DontCare // TODO: implement it
-    io.tlb(i).resp.bits.s1.entry.v := !pf
-    io.tlb(i).resp.bits.s1.entry.prefetch := DontCare
-    io.tlb(i).resp.bits.s1.entry.asid := io.csr.tlb.satp.asid
+    io.tlb(i).resp.bits.s1.pf := pf === 1.U // pf=1 indicates VS-stage page fault
+    io.tlb(i).resp.bits.s1.af := false.B
+    io.tlb(i).resp.bits.s1.entry.v := pf === 0.U
+    io.tlb(i).resp.bits.s1.entry.prefetch := false.B
+    io.tlb(i).resp.bits.s1.entry.asid := Mux(
+      s2xlateReg =/= noS2xlate,
+      io.csr.tlb.vsatp.asid,
+      io.csr.tlb.satp.asid
+    )
+    // S1 entry vmid (H-extension)
+    io.tlb(i).resp.bits.s1.entry.vmid.map(_ := io.csr.tlb.hgatp.vmid)
+    // S1 entry n (NAPOT support)
+    io.tlb(i).resp.bits.s1.entry.n.map(_ := Mux(
+      pte.n.asBool && pte.ppn(3, 0) === 8.U && level === 0.U,
+      1.U,
+      0.U
+    ))
+    // S1 sector TLB fields
+    io.tlb(i).resp.bits.s1.addr_low := vpnDelayed(sectortlbwidth - 1, 0)
+    for (j <- 0 until tlbcontiguous) {
+      io.tlb(i).resp.bits.s1.ppn_low(j) := pte.ppn(sectortlbwidth - 1, 0)
+      io.tlb(i).resp.bits.s1.valididx(j) := (j.U === vpnDelayed(sectortlbwidth - 1, 0)) || (level =/= 0.U)
+      io.tlb(i).resp.bits.s1.pteidx(j) := j.U === vpnDelayed(sectortlbwidth - 1, 0)
+    }
+
+    // S2 (G-Stage) response - HptwResp fields
+    io.tlb(i).resp.bits.s2.entry.tag := vpnDelayed
+    io.tlb(i).resp.bits.s2.entry.pbmt := pte.pbmt
+    io.tlb(i).resp.bits.s2.entry.ppn := pte.ppn
+    io.tlb(i).resp.bits.s2.entry.perm.map(_ := pte.getPerm())
+    io.tlb(i).resp.bits.s2.entry.level.map(_ := level)
+    io.tlb(i).resp.bits.s2.gpf := pf === 2.U // pf=2 indicates G-stage page fault
+    io.tlb(i).resp.bits.s2.gaf := false.B
+    io.tlb(i).resp.bits.s2.entry.v := pf === 0.U
+    // S2 entry asid (not used in G-stage, set to DontCare)
+    io.tlb(i).resp.bits.s2.entry.asid := DontCare
+    // S2 entry vmid (H-extension)
+    io.tlb(i).resp.bits.s2.entry.vmid.map(_ := io.csr.tlb.hgatp.vmid)
+    // S2 entry n (NAPOT support)
+    io.tlb(i).resp.bits.s2.entry.n.map(_ := Mux(
+      pte.n.asBool && pte.ppn(3, 0) === 8.U && level === 0.U,
+      1.U,
+      0.U
+    ))
+    // S2 entry prefetch
+    io.tlb(i).resp.bits.s2.entry.prefetch := false.B
+
+    // Pass through s2xlate mode to response
+    io.tlb(i).resp.bits.s2xlate := s2xlateReg
   }
+
+  // WFI (Wait For Interrupt) signal - always safe in FakePTW mode
+  io.wfi.wfiSafe := true.B
 }
 
 class L2TLBWrapper()(implicit p: Parameters) extends LazyModule with HasXSParameter {

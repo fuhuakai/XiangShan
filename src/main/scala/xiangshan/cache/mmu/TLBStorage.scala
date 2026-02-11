@@ -295,16 +295,19 @@ class TLBFA(
   println(s"${parentName} tlb_fa: nSets${nSets} nWays:${nWays}")
 }
 
+// TLBFakeFA: Software TLB implementation using DPI-C PTEHelper for debug/simulation
+// This module bypasses hardware page table walk and uses C++ reference model instead
 class TLBFakeFA(
-             ports: Int,
-             nDups: Int,
-             nSets: Int,
-             nWays: Int,
-             useDmode: Boolean = false
-           )(implicit p: Parameters) extends TlbModule with HasCSRConst{
+  ports: Int,
+  nDups: Int,
+  nSets: Int,
+  nWays: Int,
+  useDmode: Boolean = false
+)(implicit p: Parameters) extends TlbModule with HasCSRConst {
 
   val io = IO(new TlbStorageIO(nSets, nWays, ports, nDups))
   io.r.req.map(_.ready := true.B)
+
   val mode = if (useDmode) io.csr.priv.dmode else io.csr.priv.imode
   val vmEnable = if (EnbaleTlbDebug) (io.csr.satp.mode === 8.U)
     else (io.csr.satp.mode === 8.U && (mode < ModeM))
@@ -313,23 +316,44 @@ class TLBFakeFA(
     val req = io.r.req(i)
     val resp = io.r.resp(i)
 
+    // PTEHelper: DPI-C module for software page table walk
     val helper = Module(new PTEHelper())
     helper.clock := clock
-    helper.satp := io.csr.satp.ppn
+
+    // Host satp for single-stage translation (noS2xlate mode)
+    helper.satp := Cat(io.csr.satp.mode, io.csr.satp.asid, io.csr.satp.ppn)
+
+    // Guest vsatp for VS-stage translation (H-extension)
+    helper.vsatp := Cat(io.csr.vsatp.mode, io.csr.vsatp.asid, io.csr.vsatp.ppn)
+
+    // Hypervisor hgatp for G-stage translation (H-extension)
+    helper.hgatp := Cat(io.csr.hgatp.mode, io.csr.hgatp.vmid, io.csr.hgatp.ppn)
+
+    // Two-stage translation mode: noS2xlate/onlyStage1/onlyStage2/allStage
+    helper.s2xlate := req.bits.s2xlate
+
     helper.enable := req.fire && vmEnable
     helper.vpn := req.bits.vpn
 
+    // Parse PTE result from helper
     val pte = helper.pte.asTypeOf(new PteBundle)
     val ppn = pte.ppn
-    val vpn_reg = RegEnable(req.bits.vpn, req.valid)
+    val vpnReg = RegEnable(req.bits.vpn, req.valid)
+    val s2xlateReg = RegEnable(req.bits.s2xlate, req.valid)
     val pf = helper.pf
     val level = helper.level
 
+    // Response timing: valid one cycle after request
     resp.valid := RegNext(req.valid)
-    resp.bits.hit := true.B
+
+    // Hit is true only when no page fault (pf === 0)
+    resp.bits.hit := pf === 0.U
+
     for (d <- 0 until nDups) {
-      resp.bits.perm(d).pf := pf
+      // VS-stage permission: pf=1 indicates VS-stage page fault
+      resp.bits.perm(d).pf := pf === 1.U
       resp.bits.perm(d).af := false.B
+      resp.bits.perm(d).v := pf === 0.U
       resp.bits.perm(d).d := pte.perm.d
       resp.bits.perm(d).a := pte.perm.a
       resp.bits.perm(d).g := pte.perm.g
@@ -338,11 +362,32 @@ class TLBFakeFA(
       resp.bits.perm(d).w := pte.perm.w
       resp.bits.perm(d).r := pte.perm.r
       resp.bits.pbmt(d) := pte.pbmt
-      resp.bits.ppn(d) := MuxLookup(level, 0.U)(Seq(
-        0.U -> Cat(ppn(ppn.getWidth-1, vpnnLen*2), vpn_reg(vpnnLen*2-1, 0)),
-        1.U -> Cat(ppn(ppn.getWidth-1, vpnnLen), vpn_reg(vpnnLen-1, 0)),
-        2.U -> ppn)
-      )
+
+      // PPN calculation based on page level (superpage handling)
+      // Level 0: 4KB page - use full PPN from PTE
+      // Level 1: 2MB superpage - use upper PPN bits + VPN[8:0]
+      // Level 2: 1GB superpage - use upper PPN bits + VPN[17:0]
+      resp.bits.ppn(d) := MuxLookup(level, ppn)(Seq(
+        0.U -> ppn,
+        1.U -> Cat(ppn(ppn.getWidth - 1, vpnnLen), vpnReg(vpnnLen - 1, 0)),
+        2.U -> Cat(ppn(ppn.getWidth - 1, vpnnLen * 2), vpnReg(vpnnLen * 2 - 1, 0))
+      ))
+
+      // G-stage permission: pf=2 indicates G-stage page fault (guest page fault)
+      resp.bits.g_perm(d).pf := pf === 2.U
+      resp.bits.g_perm(d).af := false.B
+      resp.bits.g_perm(d).v := pf === 0.U
+      resp.bits.g_perm(d).d := pte.perm.d
+      resp.bits.g_perm(d).a := pte.perm.a
+      resp.bits.g_perm(d).g := pte.perm.g
+      resp.bits.g_perm(d).u := pte.perm.u
+      resp.bits.g_perm(d).x := pte.perm.x
+      resp.bits.g_perm(d).w := pte.perm.w
+      resp.bits.g_perm(d).r := pte.perm.r
+      resp.bits.g_pbmt(d) := pte.pbmt
+
+      // Pass through s2xlate mode to response
+      resp.bits.s2xlate(d) := s2xlateReg
     }
   }
 
