@@ -309,8 +309,22 @@ class TLBFakeFA(
   io.r.req.map(_.ready := true.B)
 
   val mode = if (useDmode) io.csr.priv.dmode else io.csr.priv.imode
-  val vmEnable = if (EnbaleTlbDebug) (io.csr.satp.mode === 8.U)
-    else (io.csr.satp.mode === 8.U && (mode < ModeM))
+  // Split vmEnable into host translation and virtualization translation,
+  // matching TLB.scala semantics where vmEnable only checks satp.mode
+  // and s2xlateEnable checks vsatp/hgatp.mode.
+  // FakeFA uses req.bits.s2xlate to distinguish (instead of isHyperInst/virt).
+  val Sv39Enable = io.csr.satp.mode === 8.U
+  val Sv48Enable = io.csr.satp.mode === 9.U
+  val Sv39vsEnable = io.csr.vsatp.mode === 8.U
+  val Sv48vsEnable = io.csr.vsatp.mode === 9.U
+  val Sv39x4Enable = io.csr.hgatp.mode === 8.U
+  val Sv48x4Enable = io.csr.hgatp.mode === 9.U
+  // vmEnable: host translation (noS2xlate) - only check satp.mode
+  val vmEnable = if (EnbaleTlbDebug) (Sv39Enable || Sv48Enable)
+    else ((Sv39Enable || Sv48Enable) && (mode < ModeM))
+  // s2xlateEnable: virtualization translation (onlyS1/onlyS2/allStage) - check vsatp/hgatp.mode
+  val s2xlateEnable = if (EnbaleTlbDebug) (Sv39vsEnable || Sv48vsEnable || Sv39x4Enable || Sv48x4Enable)
+    else ((Sv39vsEnable || Sv48vsEnable || Sv39x4Enable || Sv48x4Enable) && (mode < ModeM))
 
   for (i <- 0 until ports) {
     val req = io.r.req(i)
@@ -332,12 +346,15 @@ class TLBFakeFA(
     // Two-stage translation mode: noS2xlate/onlyStage1/onlyStage2/allStage
     helper.s2xlate := req.bits.s2xlate
 
-    helper.enable := req.fire && vmEnable
+    // Select enable based on s2xlate mode: noS2xlate uses vmEnable, others use s2xlateEnable
+    // Gate with !reset.asBool to prevent DPI-C pte_helper call during reset
+    // when goldenmem is not yet initialized (would cause segfault)
+    helper.enable := req.fire && Mux(req.bits.s2xlate === noS2xlate, vmEnable, s2xlateEnable) && !reset.asBool
     helper.vpn := req.bits.vpn
 
     // Parse PTE result from helper
     val pte = helper.pte.asTypeOf(new PteBundle)
-    val ppn = pte.ppn
+    val fullppn = pte.getPPN()
     val vpnReg = RegEnable(req.bits.vpn, req.valid)
     val s2xlateReg = RegEnable(req.bits.s2xlate, req.valid)
     val pf = helper.pf
@@ -346,44 +363,62 @@ class TLBFakeFA(
     // Response timing: valid one cycle after request
     resp.valid := RegNext(req.valid)
 
-    // Hit is true only when no page fault (pf === 0)
-    resp.bits.hit := pf === 0.U
+    // Fix: hit must be registered to align with PTEHelper register outputs (pte/level/pf)
+    // Previously hit was combinational (vmEnable/s2xlateEnable from CSR), causing Core to
+    // sample stale ppn at T→T+1 clock edge. RegEnable delays hit by 1 cycle to T+1,
+    // aligning with ppn/level/pf which are also stable at T+1.
+    // Use req.bits.s2xlate (not s2xlateReg) because RegEnable itself provides the 1-cycle delay.
+    resp.bits.hit := RegEnable(
+      Mux(req.bits.s2xlate === noS2xlate, vmEnable, s2xlateEnable),
+      false.B,
+      req.valid
+    )
 
     for (d <- 0 until nDups) {
-      // VS-stage permission: pf=1 indicates VS-stage page fault
+      // For allStage mode, pte_helper returns the final translated PTE (combined result).
+      // We cannot distinguish VS-stage vs G-stage permissions from a single PTE.
+      // Set perm/g_perm to all-pass so TLB's two-stage perm_check won't produce
+      // spurious exceptions. Actual exceptions are signaled via pf (pf=1: VS-stage PF, pf=2: G-stage GPF).
+      val isAllStage = s2xlateReg === allStage
+
+      // VS-stage permission
       resp.bits.perm(d).pf := pf === 1.U
       resp.bits.perm(d).af := false.B
-      resp.bits.perm(d).v := pf === 0.U
-      resp.bits.perm(d).d := pte.perm.d
-      resp.bits.perm(d).a := pte.perm.a
-      resp.bits.perm(d).g := pte.perm.g
-      resp.bits.perm(d).u := pte.perm.u
-      resp.bits.perm(d).x := pte.perm.x
-      resp.bits.perm(d).w := pte.perm.w
-      resp.bits.perm(d).r := pte.perm.r
+      resp.bits.perm(d).v := Mux(isAllStage, true.B, pf === 0.U)
+      resp.bits.perm(d).d := Mux(isAllStage, true.B, pte.perm.d)
+      resp.bits.perm(d).a := Mux(isAllStage, true.B, pte.perm.a)
+      resp.bits.perm(d).g := Mux(isAllStage, false.B, pte.perm.g)
+      resp.bits.perm(d).u := Mux(isAllStage, false.B, pte.perm.u)
+      resp.bits.perm(d).x := Mux(isAllStage, true.B, pte.perm.x)
+      resp.bits.perm(d).w := Mux(isAllStage, true.B, pte.perm.w)
+      resp.bits.perm(d).r := Mux(isAllStage, true.B, pte.perm.r)
       resp.bits.pbmt(d) := pte.pbmt
 
       // PPN calculation based on page level (superpage handling)
       // Level 0: 4KB page - use full PPN from PTE
       // Level 1: 2MB superpage - use upper PPN bits + VPN[8:0]
       // Level 2: 1GB superpage - use upper PPN bits + VPN[17:0]
-      resp.bits.ppn(d) := MuxLookup(level, ppn)(Seq(
-        0.U -> ppn,
-        1.U -> Cat(ppn(ppn.getWidth - 1, vpnnLen), vpnReg(vpnnLen - 1, 0)),
-        2.U -> Cat(ppn(ppn.getWidth - 1, vpnnLen * 2), vpnReg(vpnnLen * 2 - 1, 0))
+      // Note: fullppn is 44 bits (ptePPNLen), resp.bits.ppn is 36 bits (ppnLen),
+      // Chisel will truncate the upper 8 bits. This is correct because pte_helper
+      // returns the final HPA PPN which fits in ppnLen bits.
+      resp.bits.ppn(d) := MuxLookup(level, fullppn)(Seq(
+        0.U -> fullppn,
+        1.U -> Cat(fullppn(fullppn.getWidth - 1, vpnnLen), vpnReg(vpnnLen - 1, 0)),
+        2.U -> Cat(fullppn(fullppn.getWidth - 1, vpnnLen * 2), vpnReg(vpnnLen * 2 - 1, 0))
       ))
 
       // G-stage permission: pf=2 indicates G-stage page fault (guest page fault)
+      // For allStage mode, set to all-pass (same reason as VS-stage perm above)
       resp.bits.g_perm(d).pf := pf === 2.U
       resp.bits.g_perm(d).af := false.B
-      resp.bits.g_perm(d).v := pf === 0.U
-      resp.bits.g_perm(d).d := pte.perm.d
-      resp.bits.g_perm(d).a := pte.perm.a
-      resp.bits.g_perm(d).g := pte.perm.g
-      resp.bits.g_perm(d).u := pte.perm.u
-      resp.bits.g_perm(d).x := pte.perm.x
-      resp.bits.g_perm(d).w := pte.perm.w
-      resp.bits.g_perm(d).r := pte.perm.r
+      resp.bits.g_perm(d).v := Mux(isAllStage, true.B, pf === 0.U)
+      resp.bits.g_perm(d).d := Mux(isAllStage, true.B, pte.perm.d)
+      resp.bits.g_perm(d).a := Mux(isAllStage, true.B, pte.perm.a)
+      resp.bits.g_perm(d).g := Mux(isAllStage, false.B, pte.perm.g)
+      resp.bits.g_perm(d).u := Mux(isAllStage, false.B, pte.perm.u)
+      resp.bits.g_perm(d).x := Mux(isAllStage, true.B, pte.perm.x)
+      resp.bits.g_perm(d).w := Mux(isAllStage, true.B, pte.perm.w)
+      resp.bits.g_perm(d).r := Mux(isAllStage, true.B, pte.perm.r)
       resp.bits.g_pbmt(d) := pte.pbmt
 
       // Pass through s2xlate mode to response

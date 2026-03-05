@@ -1016,10 +1016,10 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     io.csr.tlb.vsatp.changed ||
     io.csr.tlb.hgatp.changed ||
     io.csr.tlb.priv.virt_changed
-  // flush(0) := DelayN(flushCond, itlbParams.fenceDelay)
-  // flush(1) := DelayN(flushCond, ldtlbParams.fenceDelay)
-    flush(0) := flushCond
-    flush(1) := flushCond
+  flush(0) := DelayN(flushCond, itlbParams.fenceDelay)
+  flush(1) := DelayN(flushCond, ldtlbParams.fenceDelay)
+    // flush(0) := flushCond
+    // flush(1) := flushCond
 
   for (i <- 0 until PtwWidth) {
     // PTEHelper: DPI-C module for software page table walk
@@ -1037,11 +1037,13 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
 
     // Connect helper inputs with optional delay for timing simulation
     if (coreParams.softPTWDelay == 1) {
-      helper.enable := io.tlb(i).req(0).fire
+      // Gate with !reset.asBool to prevent DPI-C pte_helper call during reset
+      helper.enable := io.tlb(i).req(0).fire && !reset.asBool
       helper.vpn := io.tlb(i).req(0).bits.vpn
       helper.s2xlate := io.tlb(i).req(0).bits.s2xlate
     } else {
-      helper.enable := PTWDelayN(io.tlb(i).req(0).fire, coreParams.softPTWDelay - 1, flush(i))
+      // Gate with !reset.asBool to prevent DPI-C pte_helper call during reset
+      helper.enable := PTWDelayN(io.tlb(i).req(0).fire, coreParams.softPTWDelay - 1, flush(i)) && !reset.asBool
       helper.vpn := PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay - 1, flush(i))
       helper.s2xlate := PTWDelayN(io.tlb(i).req(0).bits.s2xlate, coreParams.softPTWDelay - 1, flush(i))
     }
@@ -1056,6 +1058,10 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     } else {
       PTWDelayN(io.tlb(i).req(0).bits.s2xlate, coreParams.softPTWDelay, flush(i))
     }
+    // PTEHelper outputs (pte/level/pf) are register outputs (updated at posedge clock when enable=true).
+    // When softPTWDelay == 1: helper.enable fires at T, outputs stable at T+1 (same as vpnDelayed/resp.valid)
+    // When softPTWDelay == N: helper.enable fires at T+(N-1), outputs stable at T+N (same as vpnDelayed/resp.valid)
+    // So pte/level/pf are already aligned with vpnDelayed and resp.valid — no extra delay needed.
 
     // Request/response handshake logic
     val empty = RegInit(true.B)
@@ -1070,10 +1076,31 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     assert(!io.tlb(i).resp.valid || io.tlb(i).resp.ready)
 
     // S1 (VS-Stage) response - PtwSectorResp fields
-    io.tlb(i).resp.bits.s1.entry.tag := vpnDelayed
+    // Get full 44-bit PPN from PteBundle
+    val fullppn = pte.getPPN()
+    val isAllStage = s2xlateReg === allStage
+
+    // For allStage mode, pte_helper returns the final translated result (HPA PPN + merged perm).
+    // TLB consumes PTW response via: s1_ppn = stage1.genPPN(vpn), s2_ppn = stage2.genPPNS2(s1_ppn).
+    // To avoid "double translation", we set s2.entry.level = 0 so genPPNS2 returns s2.entry.ppn directly.
+    // For permissions, we set s1/s2 perm to all-pass since we can't distinguish VS/G-stage perms
+    // from a single PTE. Exceptions are signaled via pf (pf=1: VS-stage PF, pf=2: G-stage GPF).
+
+    // Construct all-pass PtePermBundle for allStage mode
+    val allPassPerm = Wire(new PtePermBundle)
+    allPassPerm.d := true.B
+    allPassPerm.a := true.B
+    allPassPerm.g := false.B
+    allPassPerm.u := false.B
+    allPassPerm.x := true.B
+    allPassPerm.w := true.B
+    allPassPerm.r := true.B
+
+    io.tlb(i).resp.bits.s1.entry.tag := vpnDelayed(vpnDelayed.getWidth - 1, sectortlbwidth) 
     io.tlb(i).resp.bits.s1.entry.pbmt := pte.pbmt
-    io.tlb(i).resp.bits.s1.entry.ppn := pte.ppn
-    io.tlb(i).resp.bits.s1.entry.perm.map(_ := pte.getPerm())
+    // entry.ppn is 41 bits (sectorptePPNLen), extract high 41 bits from full 44-bit PPN
+    io.tlb(i).resp.bits.s1.entry.ppn := fullppn(ptePPNLen - 1, sectortlbwidth)
+    io.tlb(i).resp.bits.s1.entry.perm.map(_ := Mux(isAllStage, allPassPerm, pte.getPerm()))
     io.tlb(i).resp.bits.s1.entry.level.map(_ := level)
     io.tlb(i).resp.bits.s1.pf := pf === 1.U // pf=1 indicates VS-stage page fault
     io.tlb(i).resp.bits.s1.af := false.B
@@ -1094,18 +1121,23 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     ))
     // S1 sector TLB fields
     io.tlb(i).resp.bits.s1.addr_low := vpnDelayed(sectortlbwidth - 1, 0)
+    // ppn_low stores the low 3 bits of PPN for each sector
     for (j <- 0 until tlbcontiguous) {
-      io.tlb(i).resp.bits.s1.ppn_low(j) := pte.ppn(sectortlbwidth - 1, 0)
+      io.tlb(i).resp.bits.s1.ppn_low(j) := fullppn(sectortlbwidth - 1, 0)
       io.tlb(i).resp.bits.s1.valididx(j) := (j.U === vpnDelayed(sectortlbwidth - 1, 0)) || (level =/= 0.U)
       io.tlb(i).resp.bits.s1.pteidx(j) := j.U === vpnDelayed(sectortlbwidth - 1, 0)
     }
 
     // S2 (G-Stage) response - HptwResp fields
+    // HptwResp.entry is PtwEntry(tagLen = gvpnLen), tag should be full gvpn (not sector format)
     io.tlb(i).resp.bits.s2.entry.tag := vpnDelayed
     io.tlb(i).resp.bits.s2.entry.pbmt := pte.pbmt
+    // HptwResp.entry.ppn width = gvpnLen. Match HptwResp.apply() which uses pte.ppn (ppnLen bits, zero-extended)
     io.tlb(i).resp.bits.s2.entry.ppn := pte.ppn
-    io.tlb(i).resp.bits.s2.entry.perm.map(_ := pte.getPerm())
-    io.tlb(i).resp.bits.s2.entry.level.map(_ := level)
+    io.tlb(i).resp.bits.s2.entry.perm.map(_ := Mux(isAllStage, allPassPerm, pte.getPerm()))
+    // For allStage: set s2.level = 0 so genPPNS2(gvpn) returns s2.entry.ppn directly (no superpage splicing)
+    // This prevents the "double translation" where genPPNS2 would splice vpn bits into an already-final HPA PPN
+    io.tlb(i).resp.bits.s2.entry.level.map(_ := Mux(isAllStage, 0.U, level))
     io.tlb(i).resp.bits.s2.gpf := pf === 2.U // pf=2 indicates G-stage page fault
     io.tlb(i).resp.bits.s2.gaf := false.B
     io.tlb(i).resp.bits.s2.entry.v := pf === 0.U
@@ -1114,11 +1146,12 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     // S2 entry vmid (H-extension)
     io.tlb(i).resp.bits.s2.entry.vmid.map(_ := io.csr.tlb.hgatp.vmid)
     // S2 entry n (NAPOT support)
-    io.tlb(i).resp.bits.s2.entry.n.map(_ := Mux(
+    // For allStage: set n = 0 to ensure genPPNS2 uses the simple ppn path (no NAPOT splicing)
+    io.tlb(i).resp.bits.s2.entry.n.map(_ := Mux(isAllStage, 0.U, Mux(
       pte.n.asBool && pte.ppn(3, 0) === 8.U && level === 0.U,
       1.U,
       0.U
-    ))
+    )))
     // S2 entry prefetch
     io.tlb(i).resp.bits.s2.entry.prefetch := false.B
 

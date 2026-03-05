@@ -281,8 +281,8 @@ case class XSCoreParameters
   )),
   L2NBanks: Int = 1,
   usePTWRepeater: Boolean = false,
-  softTLB: Boolean = false, // dpi-c l1tlb debug only
-  softPTW: Boolean = false, // dpi-c l2tlb debug only
+  softTLB: Boolean = true, // dpi-c l1tlb debug only
+  softPTW: Boolean = true, // dpi-c l2tlb debug only
   softPTWDelay: Int = 1,
   wfiResume: Boolean = true,
 ){
