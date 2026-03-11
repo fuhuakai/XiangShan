@@ -964,6 +964,9 @@ class PTEHelper() extends ExtModule {
   val pte     = IO(Output(UInt(64.W))) // Output: final PTE
   val level   = IO(Output(UInt(8.W)))  // Output: page level
   val pf      = IO(Output(UInt(8.W)))  // Output: page fault type (0=none, 1=VS, 2=G)
+  val s1_pte  = IO(Output(UInt(64.W))) // Output: VS-stage PTE (allStage mode)
+  val s2_pte  = IO(Output(UInt(64.W))) // Output: G-stage PTE (allStage mode)
+  val s1_level = IO(Output(UInt(8.W))) // Output: VS-stage page level (allStage mode)
 }
 
 class PTWDelayN[T <: Data](gen: T, n: Int, flush: Bool) extends Module {
@@ -1052,6 +1055,10 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     val pte = helper.pte.asTypeOf(new PteBundle)
     val level = helper.level
     val pf = helper.pf
+    // Parse VS-stage and G-stage independent PTEs for allStage mode
+    val s1Pte = helper.s1_pte.asTypeOf(new PteBundle)
+    val s2Pte = helper.s2_pte.asTypeOf(new PteBundle)
+    val s1Level = helper.s1_level
     val vpnDelayed = PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay, flush(i))
     val s2xlateReg = if (coreParams.softPTWDelay == 1) {
       RegEnable(io.tlb(i).req(0).bits.s2xlate, io.tlb(i).req(0).fire)
@@ -1080,31 +1087,27 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     val fullppn = pte.getPPN()
     val isAllStage = s2xlateReg === allStage
 
-    // For allStage mode, pte_helper returns the final translated result (HPA PPN + merged perm).
+    // For allStage mode, pte_helper now returns independent VS-stage and G-stage PTEs
+    // via s1_pte/s2_pte outputs, so we use actual permissions instead of all-pass.
     // TLB consumes PTW response via: s1_ppn = stage1.genPPN(vpn), s2_ppn = stage2.genPPNS2(s1_ppn).
-    // To avoid "double translation", we set s2.entry.level = 0 so genPPNS2 returns s2.entry.ppn directly.
-    // For permissions, we set s1/s2 perm to all-pass since we can't distinguish VS/G-stage perms
-    // from a single PTE. Exceptions are signaled via pf (pf=1: VS-stage PF, pf=2: G-stage GPF).
+    // For allStage: s1 stores VS-stage PTE (GPA PPN + VS-level), s2 stores G-stage PTE (HPA PPN + G-level).
+    // genPPN(vpn) produces GPA PPN, genPPNS2(gpa_ppn) produces HPA PPN.
 
-    // Construct all-pass PtePermBundle for allStage mode
-    val allPassPerm = Wire(new PtePermBundle)
-    allPassPerm.d := true.B
-    allPassPerm.a := true.B
-    allPassPerm.g := false.B
-    allPassPerm.u := false.B
-    allPassPerm.x := true.B
-    allPassPerm.w := true.B
-    allPassPerm.r := true.B
+    // In allStage mode, use VS-stage PTE's PPN for s1 (GPA), G-stage PTE's PPN for s2 (HPA)
+    val s1FullPPN = s1Pte.getPPN()
+    val s2FullPPN = s2Pte.getPPN()
 
     io.tlb(i).resp.bits.s1.entry.tag := vpnDelayed(vpnDelayed.getWidth - 1, sectortlbwidth) 
-    io.tlb(i).resp.bits.s1.entry.pbmt := pte.pbmt
+    io.tlb(i).resp.bits.s1.entry.pbmt := Mux(isAllStage, s1Pte.pbmt, pte.pbmt)
     // entry.ppn is 41 bits (sectorptePPNLen), extract high 41 bits from full 44-bit PPN
-    io.tlb(i).resp.bits.s1.entry.ppn := fullppn(ptePPNLen - 1, sectortlbwidth)
-    io.tlb(i).resp.bits.s1.entry.perm.map(_ := Mux(isAllStage, allPassPerm, pte.getPerm()))
-    io.tlb(i).resp.bits.s1.entry.level.map(_ := level)
+    io.tlb(i).resp.bits.s1.entry.ppn := Mux(isAllStage, s1FullPPN(ptePPNLen - 1, sectortlbwidth), fullppn(ptePPNLen - 1, sectortlbwidth))
+    // For allStage mode, use actual VS-stage and G-stage permissions from independent PTEs
+    // instead of all-pass, so L1TLB's perm_check can correctly detect permission violations
+    io.tlb(i).resp.bits.s1.entry.perm.map(_ := Mux(isAllStage, s1Pte.getPerm(), pte.getPerm()))
+    io.tlb(i).resp.bits.s1.entry.level.map(_ :=  Mux(isAllStage, s1Level, level))
     io.tlb(i).resp.bits.s1.pf := pf === 1.U // pf=1 indicates VS-stage page fault
     io.tlb(i).resp.bits.s1.af := false.B
-    io.tlb(i).resp.bits.s1.entry.v := pf === 0.U
+    io.tlb(i).resp.bits.s1.entry.v := Mux(isAllStage, s1Pte.perm.v, pf === 0.U)
     io.tlb(i).resp.bits.s1.entry.prefetch := false.B
     io.tlb(i).resp.bits.s1.entry.asid := Mux(
       s2xlateReg =/= noS2xlate,
@@ -1114,44 +1117,44 @@ class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     // S1 entry vmid (H-extension)
     io.tlb(i).resp.bits.s1.entry.vmid.map(_ := io.csr.tlb.hgatp.vmid)
     // S1 entry n (NAPOT support)
-    io.tlb(i).resp.bits.s1.entry.n.map(_ := Mux(
-      pte.n.asBool && pte.ppn(3, 0) === 8.U && level === 0.U,
-      1.U,
-      0.U
+    io.tlb(i).resp.bits.s1.entry.n.map(_ := Mux(isAllStage,
+      Mux(s1Pte.n.asBool && s1Pte.ppn(3, 0) === 8.U && s1Level === 0.U, 1.U, 0.U),
+      Mux(pte.n.asBool && pte.ppn(3, 0) === 8.U && level === 0.U, 1.U, 0.U)
     ))
     // S1 sector TLB fields
     io.tlb(i).resp.bits.s1.addr_low := vpnDelayed(sectortlbwidth - 1, 0)
     // ppn_low stores the low 3 bits of PPN for each sector
     for (j <- 0 until tlbcontiguous) {
-      io.tlb(i).resp.bits.s1.ppn_low(j) := fullppn(sectortlbwidth - 1, 0)
-      io.tlb(i).resp.bits.s1.valididx(j) := (j.U === vpnDelayed(sectortlbwidth - 1, 0)) || (level =/= 0.U)
+      io.tlb(i).resp.bits.s1.ppn_low(j) := Mux(isAllStage, s1FullPPN(sectortlbwidth - 1, 0), fullppn(sectortlbwidth - 1, 0))
+      io.tlb(i).resp.bits.s1.valididx(j) := Mux(isAllStage,
+        (j.U === vpnDelayed(sectortlbwidth - 1, 0)) || (s1Level =/= 0.U),
+        (j.U === vpnDelayed(sectortlbwidth - 1, 0)) || (level =/= 0.U)
+      )
       io.tlb(i).resp.bits.s1.pteidx(j) := j.U === vpnDelayed(sectortlbwidth - 1, 0)
     }
 
     // S2 (G-Stage) response - HptwResp fields
     // HptwResp.entry is PtwEntry(tagLen = gvpnLen), tag should be full gvpn (not sector format)
     io.tlb(i).resp.bits.s2.entry.tag := vpnDelayed
-    io.tlb(i).resp.bits.s2.entry.pbmt := pte.pbmt
-    // HptwResp.entry.ppn width = gvpnLen. Match HptwResp.apply() which uses pte.ppn (ppnLen bits, zero-extended)
-    io.tlb(i).resp.bits.s2.entry.ppn := pte.ppn
-    io.tlb(i).resp.bits.s2.entry.perm.map(_ := Mux(isAllStage, allPassPerm, pte.getPerm()))
-    // For allStage: set s2.level = 0 so genPPNS2(gvpn) returns s2.entry.ppn directly (no superpage splicing)
-    // This prevents the "double translation" where genPPNS2 would splice vpn bits into an already-final HPA PPN
-    io.tlb(i).resp.bits.s2.entry.level.map(_ := Mux(isAllStage, 0.U, level))
+    io.tlb(i).resp.bits.s2.entry.pbmt := Mux(isAllStage, s2Pte.pbmt, pte.pbmt)
+    // For allStage: use G-stage PTE's PPN (HPA PPN) so genPPNS2 can correctly splice with GPA
+    io.tlb(i).resp.bits.s2.entry.ppn := Mux(isAllStage, s2Pte.ppn, pte.ppn)
+    io.tlb(i).resp.bits.s2.entry.perm.map(_ := Mux(isAllStage, s2Pte.getPerm(), pte.getPerm()))
+    // For allStage: use G-stage level so genPPNS2 correctly handles superpage splicing
+    // (helper.level is already G-stage level in allStage mode, since pte_helper overwrites it)
+    io.tlb(i).resp.bits.s2.entry.level.map(_ := level)
     io.tlb(i).resp.bits.s2.gpf := pf === 2.U // pf=2 indicates G-stage page fault
     io.tlb(i).resp.bits.s2.gaf := false.B
-    io.tlb(i).resp.bits.s2.entry.v := pf === 0.U
+    io.tlb(i).resp.bits.s2.entry.v := Mux(isAllStage, s2Pte.perm.v, pf === 0.U)
     // S2 entry asid (not used in G-stage, set to DontCare)
     io.tlb(i).resp.bits.s2.entry.asid := DontCare
     // S2 entry vmid (H-extension)
     io.tlb(i).resp.bits.s2.entry.vmid.map(_ := io.csr.tlb.hgatp.vmid)
     // S2 entry n (NAPOT support)
-    // For allStage: set n = 0 to ensure genPPNS2 uses the simple ppn path (no NAPOT splicing)
-    io.tlb(i).resp.bits.s2.entry.n.map(_ := Mux(isAllStage, 0.U, Mux(
-      pte.n.asBool && pte.ppn(3, 0) === 8.U && level === 0.U,
-      1.U,
-      0.U
-    )))
+    io.tlb(i).resp.bits.s2.entry.n.map(_ := Mux(isAllStage,
+      Mux(s2Pte.n.asBool && s2Pte.ppn(3, 0) === 8.U && level === 0.U, 1.U, 0.U),
+      Mux(pte.n.asBool && pte.ppn(3, 0) === 8.U && level === 0.U, 1.U, 0.U)
+    ))
     // S2 entry prefetch
     io.tlb(i).resp.bits.s2.entry.prefetch := false.B
 

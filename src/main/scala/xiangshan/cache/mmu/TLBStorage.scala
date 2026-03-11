@@ -359,7 +359,10 @@ class TLBFakeFA(
     val s2xlateReg = RegEnable(req.bits.s2xlate, req.valid)
     val pf = helper.pf
     val level = helper.level
-
+    // Parse VS-stage and G-stage independent PTEs for allStage mode
+    val s1Pte = helper.s1_pte.asTypeOf(new PteBundle)
+    val s2Pte = helper.s2_pte.asTypeOf(new PteBundle)
+    
     // Response timing: valid one cycle after request
     resp.valid := RegNext(req.valid)
 
@@ -375,23 +378,21 @@ class TLBFakeFA(
     )
 
     for (d <- 0 until nDups) {
-      // For allStage mode, pte_helper returns the final translated PTE (combined result).
-      // We cannot distinguish VS-stage vs G-stage permissions from a single PTE.
-      // Set perm/g_perm to all-pass so TLB's two-stage perm_check won't produce
-      // spurious exceptions. Actual exceptions are signaled via pf (pf=1: VS-stage PF, pf=2: G-stage GPF).
+      // For allStage mode, pte_helper now returns independent VS-stage and G-stage PTEs
+      // via s1_pte/s2_pte outputs, so we use actual permissions for each stage.
       val isAllStage = s2xlateReg === allStage
 
       // VS-stage permission
       resp.bits.perm(d).pf := pf === 1.U
       resp.bits.perm(d).af := false.B
       resp.bits.perm(d).v := Mux(isAllStage, true.B, pf === 0.U)
-      resp.bits.perm(d).d := Mux(isAllStage, true.B, pte.perm.d)
-      resp.bits.perm(d).a := Mux(isAllStage, true.B, pte.perm.a)
-      resp.bits.perm(d).g := Mux(isAllStage, false.B, pte.perm.g)
-      resp.bits.perm(d).u := Mux(isAllStage, false.B, pte.perm.u)
-      resp.bits.perm(d).x := Mux(isAllStage, true.B, pte.perm.x)
-      resp.bits.perm(d).w := Mux(isAllStage, true.B, pte.perm.w)
-      resp.bits.perm(d).r := Mux(isAllStage, true.B, pte.perm.r)
+      resp.bits.perm(d).d := Mux(isAllStage, s1Pte.perm.d, pte.perm.d)
+      resp.bits.perm(d).a := Mux(isAllStage, s1Pte.perm.a, pte.perm.a)
+      resp.bits.perm(d).g := Mux(isAllStage, s1Pte.perm.g, pte.perm.g)
+      resp.bits.perm(d).u := Mux(isAllStage, s1Pte.perm.u, pte.perm.u)
+      resp.bits.perm(d).x := Mux(isAllStage, s1Pte.perm.x, pte.perm.x)
+      resp.bits.perm(d).w := Mux(isAllStage, s1Pte.perm.w, pte.perm.w)
+      resp.bits.perm(d).r := Mux(isAllStage, s1Pte.perm.r, pte.perm.r)
       resp.bits.pbmt(d) := pte.pbmt
 
       // PPN calculation based on page level (superpage handling)
@@ -401,24 +402,35 @@ class TLBFakeFA(
       // Note: fullppn is 44 bits (ptePPNLen), resp.bits.ppn is 36 bits (ppnLen),
       // Chisel will truncate the upper 8 bits. This is correct because pte_helper
       // returns the final HPA PPN which fits in ppnLen bits.
-      resp.bits.ppn(d) := MuxLookup(level, fullppn)(Seq(
+
+      // When pf != 0 (page fault), the PTE's PPN is invalid/meaningless.
+      // We must NOT send this invalid PPN to PMP/PMA check, because:
+      //   1. TLBFakeFA keeps hit=true (cannot use hit=false: DTLB uses TLBNonBlock,
+      //      miss triggers PTW->FakePTW->refill loop that deadlocks since FakeFA has no storage)
+      //   2. hit=true causes TLB to use this PPN for PMP/PMA check
+      //   3. Invalid PPN may fall outside PMA-allowed regions, producing spurious access fault
+      //   4. In LoadUnit S2, s2_pmp.ld is OR'd into loadAccessFault, overriding the correct page fault
+      // Fix: when pf != 0, output vpnReg as PPN (identity mapping). The virtual address
+      // in softtlb test scenarios is typically in DRAM range (0x80000000+), which passes PMA check.
+      // This ensures perm_check's pf signal (already correctly set) is not overridden by spurious af.
+      val normalPPN = MuxLookup(level, fullppn)(Seq(
         0.U -> fullppn,
         1.U -> Cat(fullppn(fullppn.getWidth - 1, vpnnLen), vpnReg(vpnnLen - 1, 0)),
         2.U -> Cat(fullppn(fullppn.getWidth - 1, vpnnLen * 2), vpnReg(vpnnLen * 2 - 1, 0))
       ))
+      resp.bits.ppn(d) := Mux(pf =/= 0.U, vpnReg, normalPPN)
 
       // G-stage permission: pf=2 indicates G-stage page fault (guest page fault)
-      // For allStage mode, set to all-pass (same reason as VS-stage perm above)
+      // For allStage mode, use actual G-stage permissions from s2_pte
       resp.bits.g_perm(d).pf := pf === 2.U
       resp.bits.g_perm(d).af := false.B
-      resp.bits.g_perm(d).v := Mux(isAllStage, true.B, pf === 0.U)
-      resp.bits.g_perm(d).d := Mux(isAllStage, true.B, pte.perm.d)
-      resp.bits.g_perm(d).a := Mux(isAllStage, true.B, pte.perm.a)
-      resp.bits.g_perm(d).g := Mux(isAllStage, false.B, pte.perm.g)
-      resp.bits.g_perm(d).u := Mux(isAllStage, false.B, pte.perm.u)
-      resp.bits.g_perm(d).x := Mux(isAllStage, true.B, pte.perm.x)
-      resp.bits.g_perm(d).w := Mux(isAllStage, true.B, pte.perm.w)
-      resp.bits.g_perm(d).r := Mux(isAllStage, true.B, pte.perm.r)
+      resp.bits.g_perm(d).d := Mux(isAllStage, s2Pte.perm.d, pte.perm.d)
+      resp.bits.g_perm(d).a := Mux(isAllStage, s2Pte.perm.a, pte.perm.a)
+      resp.bits.g_perm(d).g := Mux(isAllStage, s2Pte.perm.g, pte.perm.g)
+      resp.bits.g_perm(d).u := Mux(isAllStage, s2Pte.perm.u, pte.perm.u)
+      resp.bits.g_perm(d).x := Mux(isAllStage, s2Pte.perm.x, pte.perm.x)
+      resp.bits.g_perm(d).w := Mux(isAllStage, s2Pte.perm.w, pte.perm.w)
+      resp.bits.g_perm(d).r := Mux(isAllStage, s2Pte.perm.r, pte.perm.r)
       resp.bits.g_pbmt(d) := pte.pbmt
 
       // Pass through s2xlate mode to response
